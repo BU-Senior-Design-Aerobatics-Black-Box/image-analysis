@@ -8,6 +8,11 @@ import matplotlib.pyplot as plt
 from sklearn.cluster import KMeans
 from skimage.measure import label
 from sklearn.feature_extraction import image
+from skimage.transform import hough_line, hough_line_peaks
+from skimage.transform import hough_circle, hough_circle_peaks
+from skimage.transform import AffineTransform, warp
+from skimage.feature import canny
+from skimage import color
 import time
 from time import sleep
 import json
@@ -18,7 +23,7 @@ import RPi.GPIO as GPIO
 #import berryIMU
 GPIO.setmode(GPIO.BOARD)
 GPIO.setwarnings(False)
-ledPin = ledPin1 = 36
+ledPin = ledPin1 = 22
 ledPin2 = 12
 GPIO.setup(ledPin1, GPIO.OUT)
 GPIO.setup(ledPin2, GPIO.OUT)
@@ -144,9 +149,16 @@ class Configerator():
 class SpeedFinder():
     def __init__(self, config_path="config.json", debug=True):
         self.reset_config(config_path)
+        self.default_config(speed_over_angle=90/(pi/2), tach_speed_over_angle=15/(pi/2))
         self.debug = debug
         self.exit_event = None
         self.is_running = False
+        # for dial reading
+        self.airspeed_circ = None
+        self.tach_circ = None
+        # for cable tracking: default values
+        self.cable_middle_r = 597.6418
+        self.cable_range_r = 89.352
 
     def reset_config(self, config_path):
         with open(config_path, "r") as f:
@@ -157,6 +169,43 @@ class SpeedFinder():
             self.circle = config_dict["circle"]
         except Exception as e:
             raise Exception("error reading config dict", e)
+
+    def default_config(self, speed_over_angle, tach_speed_over_angle):
+        self.speed_over_angle = speed_over_angle
+        self.tach_speed_over_angle = tach_speed_over_angle
+
+    #def reset_config(self, userpoint, speed_over_angle, circle):
+    #    self.userpoint = userpoint
+    #    self.speed_over_angle = speed_over_angle
+    #    self.circle = circle  # (row, col, rad)
+    #    self.airspeed_circ = None
+    #    self.tach_circ = None
+
+    def unwarp_image(self,im, t_inv):
+        t_inv /= np.sqrt(np.linalg.det(t_inv)) / 1.5  # make it a bit bigger
+        t_inv_full = np.array([[t_inv[0,0], t_inv[0,1], 0.],
+                            [t_inv[1,0], t_inv[1,1], 0.],
+                            [0.0,        0.0,        1.]])
+        t = np.linalg.inv(t_inv_full)
+        affine_tf = AffineTransform(matrix=t)
+        unwarped = warp(im, affine_tf)
+        return unwarped
+
+    def get_dial_ijr(self, im_unwarped):
+        gray = color.rgb2gray(im_unwarped)
+        edges = canny(gray, sigma=0.7, low_threshold=0.55, high_threshold=0.9)
+        hough_radii = np.arange(50, 200, 1)
+        hough_res = hough_circle(edges, hough_radii)
+        accums, cx, cy, radii = hough_circle_peaks(hough_res, hough_radii, #min_xdistance=20, min_ydistance=20,
+                                            total_num_peaks=1)
+        circles = list(zip(cy, cx, radii))
+        return circles[0]
+    
+    def shrink_im_to_circle(self, im, i, j, r):
+        rowbounds = [i-r, i+r]
+        colbounds = [j-r, j+r]
+        smaller_im = im[rowbounds[0]:rowbounds[1], colbounds[0]:colbounds[1]]
+        return smaller_im
 
     def show_cluster(self, px, shape):
         if threading.current_thread() != threading.main_thread():
@@ -220,15 +269,31 @@ class SpeedFinder():
             return False
         except:
             return False
+    
+    def is_cluster_in_circle(self, cluster, i, j, r):
+        cluster_centered = cluster - [i,j]
+        px_dists_sq = np.sum(np.power(cluster_centered, 2), axis=1)
+        return np.max(px_dists_sq) <= (r+5)*(r+5) # leave a bit of buffer
 
-    def lineness_metric(self, cluster, n_buckets=30):
+    def lineness_metric(self, cluster, center=None, n_buckets=30):
         # get the variance of frequencies of angles of pixels around the center
         # circles -> low variance, lines -> high variance
         cluster = np.array(cluster)  # just in case
-        center = [np.mean(cluster[:,0]), np.mean(cluster[:,1])]
+        if center is None:
+            center = [np.mean(cluster[:,0]), np.mean(cluster[:,1])]
+            using_center_of_mass = True
+        else:
+            using_center_of_mass = False
         de_meaned = cluster - center
         angles = np.array([np.arctan2(o, a) for o,a in de_meaned])
-        angle_freqs = np.histogram(angles, bins=n_buckets, range=(-pi, pi))[0]
+        if using_center_of_mass:
+            # A dial needle extends in 2 directions away from its CoM,
+            # so deduplicate that by checking angles in range (-pi/2, pi/2)
+            angle_freqs = np.histogram(angles, bins=n_buckets, range=(-pi/2, pi/2))[0]
+        else:
+            # Then we are checking angles around the center of the dial;
+            # all pixels of the dial needle should be at one angle
+            angle_freqs = np.histogram(angles, bins=n_buckets, range=(-pi, pi))[0]
         scaled_angle_freqs = angle_freqs/len(angles)
         return np.std(scaled_angle_freqs), scaled_angle_freqs
 
@@ -237,15 +302,156 @@ class SpeedFinder():
         center_of_mass = [np.mean(de_centered[:,0]), np.mean(de_centered[:,1])]
         # coords are like
         # +---> y
-        # | \
-        # |  `' angle opens towards y
-        # x
+        # |u\
+        # |  \  angle opens towards y
+        # x   `
         angle = np.arctan2(center_of_mass[1], center_of_mass[0])
         # fix reference
         angle = (-angle + pi)
         return angle
     
+    def calibrate_cable(self):
+        # FUTURE WORK: calibrate based on the user's own video
+        locs = []
+        for i in range(1,271):
+            img = Image.open(f"vid1/video-frame{i:05}.png") # next image of cable
+            im = np.array(img)
+            loc = self.get_cable_loc(im)
+            locs.append(loc)
+        locs = np.array(locs)
+        
+        lower_r = np.min(locs[:,0])
+        upper_r = np.max(locs[:,0])
+        middle_r = (upper_r + lower_r)/2
+        range_r = upper_r - lower_r
+        
+        self.middle_r = middle_r
+        self.range_r = range_r
+        return middle_r, range_r
+
+    def get_cable_loc(self, im):
+        # This function expects a very specific image
+        # FUTURE WORK: allow the user to specify cable position in the camera
+        cable_patch = im[550:720, 900:1000]
+        indicator_img = (cable_patch<[20,20,20]).astype(int).sum(axis=2)
+        indicator_px = np.transpose(np.where(indicator_img>0))
+        rel_loc = [np.mean(indicator_px[:,0]), np.mean(indicator_px[:,1])]
+        abs_loc = [rel_loc[0] + 550, rel_loc[1]+900]
+        return abs_loc
+    
+    def get_cable_pos(self, im):
+        abs_r = self.get_cable_loc(im)[0]
+        scaled_r = (abs_r - self.middle_r)/self.range_r*2
+        return scaled_r
+    
+    def get_airspeed_and_tach(self, im):
+        # This function expects a very specific image
+        # FUTURE WORK: detect positions and view angles of dials automatically
+        # Get the parts of the image with the dials
+        airspeed_im = im[0:350,500:800]
+        tach_im = im[200:500,300:500]
+
+        # Unwarp the dials (the image was taken at an angle)
+        t_inv_airspeed = np.array(
+            [[0.65, -.25], 
+             [0.1,   0.63]])
+        airspeed_unwarped = self.unwarp_image(airspeed_im, t_inv_airspeed)
+        t_inv_tach = np.array(
+            [[0.68, -.32], 
+             [0.1,   0.6]])
+        tach_unwarped = self.unwarp_image(tach_im, t_inv_tach)
+        if self.debug:
+            plt.imshow(airspeed_unwarped)
+            plt.imshow(tach_unwarped)
+        
+        # Find the circles of the dials: (row, col, radius)
+        # also cache the results
+        if self.airspeed_circ is None:
+            airspeed_circ = self.get_dial_ijr(airspeed_unwarped)
+            self.airspeed_circ = airspeed_circ
+        else:
+            airspeed_circ = self.airspeed_circ
+        if self.tach_circ is None:
+            tach_circ = self.get_dial_ijr(tach_unwarped)
+            self.tach_circ = tach_circ
+        else:
+            tach_circ = self.tach_circ
+
+        # Crop the images to the circles
+        airspeed_small = self.shrink_im_to_circle(airspeed_unwarped, *airspeed_circ)
+        airspeed_shape = airspeed_small.shape[:2]
+        airspeed_center = (int(airspeed_shape[0]/2), int(airspeed_shape[1]/2))
+        tach_small = self.shrink_im_to_circle(tach_unwarped, *tach_circ)
+        tach_shape = tach_small.shape[:2]
+        tach_center = (int(tach_shape[0]/2), int(tach_shape[1]/2))
+
+        # Read the dials
+        def max_lineness(cluster, smaller_im_center):
+            # sometimes the center of the detected circle isn't the center of the dial :(
+            a = self.lineness_metric(cluster, smaller_im_center)[0]
+            b = self.lineness_metric(cluster)[0]
+            return max(a,b)
+
+        # AIRSPEED
+        try:
+            all_airspeed_clusters, clusters, kmap, _ = self.get_color_clusters(airspeed_small, n_clusters=2) # TODO: this one takes a while
+        except:
+            print("error getting clusters from smaller airspeed image")
+            print(f"airspeed_shape={airspeed_shape}")
+            return None
+        filtered_airspeed_clusters = [c for c in all_airspeed_clusters if len(c) > 100 and self.is_cluster_in_circle(c, *airspeed_center, airspeed_circ[2])]
+        if self.debug:
+            print(f"{len(filtered_airspeed_clusters)} of {len(all_airspeed_clusters)} airspeed clusters are in the bounds and large")
+        self.show_many_clusters(filtered_airspeed_clusters, airspeed_shape)
+        all_airspeed_lines = []
+        line_airspeed_clusters = []
+        for i, cluster in enumerate(filtered_airspeed_clusters):
+            tested_angles = np.linspace(-np.pi / 2, np.pi / 2, 360, endpoint=False) #new!
+            h, theta, d = hough_line(self.cluster_to_img(cluster, airspeed_shape), theta=tested_angles) #improved!
+            lines = list(zip(*hough_line_peaks(h, theta, d)))
+            if lines[0][0] > 30:
+                all_airspeed_lines.append(lines)
+                line_airspeed_clusters.append(cluster)
+        if self.debug:
+            print(f"{len(all_airspeed_lines)} airspeed clusters gave out lines")
+        linenesses_airspeed = [max_lineness(cluster, airspeed_center) for cluster in line_airspeed_clusters]
+        line_airspeed_cluster = line_airspeed_clusters[np.argmax(linenesses_airspeed)]
+        self.show_cluster(line_airspeed_cluster, airspeed_shape)
+        airspeed_angle = self.get_dial_cluster_angle(line_airspeed_cluster, airspeed_center)
+        airspeed = airspeed_angle*self.speed_over_angle
+
+        # TACH
+        try:
+            all_tach_clusters, clusters, kmap, _ = self.get_color_clusters(tach_small, n_clusters=4) # TODO: this one takes a while
+        except:
+            print("error getting clusters from smaller airspeed image")
+            print(f"tach_shape={tach_shape}")
+            return None
+        filtered_tach_clusters = [c for c in all_tach_clusters if len(c) > 100 and self.is_cluster_in_circle(c, *tach_center, tach_circ[2])]
+        if self.debug:
+            print(f"{len(filtered_tach_clusters)} of {len(all_tach_clusters)} tach clusters are in the bounds and large")
+        self.show_many_clusters(filtered_tach_clusters, tach_shape)
+        all_tach_lines = []
+        line_tach_clusters = []
+        for i, cluster in enumerate(filtered_tach_clusters):
+            tested_angles = np.linspace(-np.pi / 2, np.pi / 2, 360, endpoint=False) #new!
+            h, theta, d = hough_line(self.cluster_to_img(cluster, tach_shape), theta=tested_angles) #improved!
+            lines = list(zip(*hough_line_peaks(h, theta, d)))
+            if lines[0][0] > 30:
+                all_tach_lines.append(lines)
+                line_tach_clusters.append(cluster)
+        if self.debug:
+            print(f"{len(all_tach_lines)} tach clusters gave out lines")
+        linenesses_tach = [max_lineness(cluster, tach_center) for cluster in line_tach_clusters]
+        line_tach_cluster = line_tach_clusters[np.argmax(linenesses_tach)]
+        self.show_cluster(line_tach_cluster, tach_shape)
+        tach_angle = self.get_dial_cluster_angle(line_tach_cluster, tach_center)
+        tach = tach_angle*self.tach_speed_over_angle  # TODO: specify the position of 0 on the dial
+
+        return airspeed, tach
+    
     def get_speed(self, im):
+        # This function is for the demo
         img_shape = im.shape[:2]
 
         userpoint = self.userpoint
@@ -260,6 +466,7 @@ class SpeedFinder():
         tick = time.time()
         smaller_im = im[rowbounds[0]:rowbounds[1], colbounds[0]:colbounds[1]]
         smaller_im_shape = (rowbounds[1]-rowbounds[0], colbounds[1]-colbounds[0])
+        smaller_im_center = (int(smaller_im_shape[0]/2), int(smaller_im_shape[1]/2))
         try:
             all_clusters, clusters, kmap, _ = self.get_color_clusters(smaller_im, n_clusters=5) # TODO: this one takes a while
         except:
@@ -269,8 +476,8 @@ class SpeedFinder():
         tock = time.time()
         #print(f"getting all clusters took {tock-tick}")
         #tick = time.time()
-        #filtered_clusters = [c for c in all_clusters if len(c) > 100 and self.is_cluster_in_bounds(c, rowbounds, colbounds)]
-        filtered_clusters = [c for c in all_clusters if len(c) > 100]
+        filtered_clusters = [c for c in all_clusters if len(c) > 100 and self.is_cluster_in_circle(c, *smaller_im_center, circle[2])]
+        #filtered_clusters = [c for c in all_clusters if len(c) > 100]
         # TODO: ^ get a better cluster length bound
         if self.debug:
             print(f"{len(filtered_clusters)} of {len(all_clusters)} are in the bounds and large")
@@ -298,7 +505,15 @@ class SpeedFinder():
         if not line_clusters:
             print("no lines found")
             return None
-        linenesses = [self.lineness_metric(cluster)[0] for cluster in line_clusters]
+        
+        def max_lineness(cluster, smaller_im_center):
+            # sometimes the center of the detected circle isn't the center of the dial :(
+            a = self.lineness_metric(cluster, smaller_im_center)[0]
+            b = self.lineness_metric(cluster)[0]
+            return max(a,b)
+        
+        #linenesses = [self.lineness_metric(cluster)[0] for cluster in line_clusters]
+        linenesses = [max_lineness(cluster, smaller_im_center) for cluster in line_clusters]
         #tock = time.time()
         #print(f"getting linenesses took {tock-tick}") # getting linenesses took 0.2713451385498047
 
